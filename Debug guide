@@ -1,0 +1,182 @@
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/DEBUG_PATCH_WALKTHROUGH.md b/DEBUG_PATCH_WALKTHROUGH.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..b6c02be6a16662a5018ed27673a2f414d7bf510e
+--- /dev/null
++++ b/DEBUG_PATCH_WALKTHROUGH.md
+@@ -0,0 +1,128 @@
++# Hermes 0.3.7.6 Debug Patch Walkthrough
++
++This walkthrough explains how to inject the provided debug patch into the Hermes 0.3.7.6 training workflow. It summarizes the steps from `DEBUG_PATCH_GUIDE.md` and highlights the key entry points that `debug_patch.py` exposes so you can start debugging within minutes.
++
++---
++
++## 1. Files You Need
++
++| File | Purpose |
++|------|---------|
++| `DEBUG_PATCH_GUIDE.md` | Full reference manual for every helper included in the debug patch. |
++| `debug_patch.py` | Drop-in module that wraps your existing trainer to add validation, logging, timing, and GPU-memory tracking. |
++| Your training script / notebook (e.g., `Hermes_0_3_7_6.ipynb`) | Where you will import the patch and wrap the trainer. |
++
++Make sure `debug_patch.py` sits in the same directory (or is importable via `PYTHONPATH`) as your training script so `from debug_patch import DebugPatch` works.
++
++---
++
++## 2. Minimum Code Changes
++
++1. **Create your trainer the same way you do today.** No refactors are required.
++2. **Wrap the trainer** with the debug patch.
++3. **Call the wrapper's `train`/`train_epoch` methods** instead of calling your trainer directly.
++
++```python
++from debug_patch import DebugPatch
++
++model = EnhancedDisasterModel(...)
++trainer = DisasterTrainer(model, config)
++
++debug_patch = DebugPatch(trainer, debug_level=2, log_every_n=25)
++debug_patch.train(
++    flood_train_loader,
++    damage_train_loader,
++    flood_val_loader=flood_val_loader,
++    damage_val_loader=damage_val_loader,
++)
++```
++
++That is the entire integration: instantiate, wrap, and call.
++
++---
++
++## 3. Optional Convenience Injection
++
++If you prefer a one-line change, use `inject_debug` from `debug_patch.py`:
++
++```python
++from debug_patch import inject_debug
++
++trainer = DisasterTrainer(model, config)
++trainer = inject_debug(trainer, debug_level=2)
++trainer.train(flood_loader, damage_loader)
++```
++
++The helper returns a `DebugPatch` instance, so after this call you interact with `trainer` exactly as before.
++
++---
++
++## 4. Pre-Training Checklist
++
++Run these checks **before** long training jobs:
++
++1. **Sanity-check datasets** with `quick_diagnose(dataset, dataloader, num_samples=3)` to confirm shapes, dtypes, and loading times.
++2. **Smoke-test dataloaders** by calling `debug_patch.train_epoch(...)` for a single epoch at `debug_level=3` to surface NaNs, missing tensors, or GPU spikes early.
++3. **Tune logging frequency** via `log_every_n` to balance verbosity vs. overhead.
++
++---
++
++## 5. During Training
++
++* `DebugPatch.train_epoch` automatically:
++  * Validates the flood & damage loaders (only once at the first epoch when debug level ≥ 1).
++  * Measures iteration time, averages per-step performance, and prints GPU memory snapshots (when CUDA is available).
++  * Falls back to an internal manual loop (`_manual_train_epoch`) if your trainer lacks `train_epoch`.
++* Every `log_every_n` iterations you will see flood/damage loss, iteration time, and GPU usage so you can catch divergence early.
++* If an exception occurs, the patch prints a stack trace (for debug level ≥ 1) and stops the run cleanly so you can fix the failing batch.
++
++---
++
++## 6. After Each Epoch
++
++At the end of an epoch the wrapper prints:
++
++- Total epoch time (seconds and minutes).
++- Average step duration and derived steps-per-second.
++- GPU memory summary across the epoch (when CUDA is available).
++
++Use these summaries to spot regressions in data pipeline speed or GPU fragmentation.
++
++---
++
++## 7. Validation and Cleanup
++
++If your trainer exposes a `validate` method, the patch automatically calls it for both flood and damage loaders when you pass them to `DebugPatch.train(...)`. CUDA caches are flushed between epochs to minimize stale allocations.
++
++---
++
++## 8. Advanced Hooks
++
++| Helper | When to use |
++|--------|-------------|
++| `quick_diagnose(dataset, loader, num_samples)` | Quick offline inspection of dataset indexing and dataloader batching. |
++| `validate_batch(images, masks, name)` | Spot-check a problematic batch manually. |
++| `DebugPatch.train_epoch(...)` | Run or debug a single epoch in isolation (useful when testing new augmentations). |
++| `DebugPatch._manual_train_epoch(...)` | Automatic fallback loop when your trainer does not expose `train_epoch`. |
++
++---
++
++## 9. Suggested Workflow for Hermes 0.3.7.6
++
++1. Open `Hermes_0_3_7_6.ipynb` (or your script) and add `from debug_patch import DebugPatch` near the top.
++2. Instantiate your trainer exactly as before (this includes the optimized trainer that Hermes 0.3.7.6 ships with).
++3. Wrap it with `DebugPatch(trainer, debug_level=2)` or `inject_debug(...)`.
++4. Before the main run, execute `quick_diagnose` on each dataset & dataloader pair.
++5. Kick off the full training loop via `debug_patch.train(...)`.
++6. Watch the printed metrics/logs each `log_every_n` iterations; adjust debug level or logging cadence as needed.
++7. Investigate any warnings (e.g., NaNs, out-of-range values, GPU spikes) before resuming production-level training (debug level 0 or 1).
++
++Following these steps gives you maximal observability into Hermes 0.3.7.6 training behavior without rewriting the core trainer.
++
++---
++
++## 10. Notebook Placement Tips
++
++* **Where to insert the patch:** Drop the import/wrapper cell directly above the notebook cell that kicks off training so the optimized trainer instance is wrapped immediately before use.
++* **Handling existing cells:** Comment out (or skip) any previous "Initiate model"/trainer-construction cell so you do not accidentally instantiate and train an unwrapped trainer alongside the debug-patched one.
++* **Re-running cells:** When you need to re-run training, re-execute the optimized-trainer instantiation cell followed by the wrapper cell; there's no need to rebuild the rest of the notebook.
+diff --git a/README.md b/README.md
+index 23ffda964ecc6925387778d273593eba98ea1bb3..2c70c50356cee106597fb49fffaac3257ce04828 100644
+--- a/README.md
++++ b/README.md
+@@ -34,25 +34,39 @@ Hermes AI uses a multi-task, multi-head architecture where each model performs a
+ |------------------|-------------------------------------------|-------------------|------------------|
+ | `FloodNetHead`   | Flood segmentation                        | FloodNet, SpaceNet8 | DeepLabV3+ (ResNet-101) |
+ | `DamageNetHead`  | Building damage classification (none/minor/major/destroyed) | xBD, RescueNet    | DeepLabV3+       |
+ | `DebrisNetHead`  | Road debris segmentation                  | Custom UAV labels | UNet             |
+ | `FireNetHead`    | Burn scar detection (WIP)                 | FireNet, MODIS    | EfficientNet     |
+ 
+ All models are modular and can be run **individually or as together**, depending on the deployment scenario.
+ 
+ ---
+ 
+ ##  Key Features
+ 
+  Multi-task segmentation (flood, damage, debris)
+ 
+  Pre-/post-event change detection (using dual inputs)
+ 
+  UAV + Satellite compatibility (.tif, .jpeg, .png)
+ 
+  Google Colab A100-ready training notebooks
+ 
+  Export to GeoTIFF and ArcGIS integration
+ 
+  Designed for on-site field operation via local inference or cloud-streamed inputs
+ 
+ ---
++
++##  Debugging Hermes 0.3.7.6
++
++Hermes 0.3.7.6 ships with an injectable debug patch (`debug_patch.py`) and a comprehensive usage reference (`DEBUG_PATCH_GUIDE.md`).
++
++1. Import and wrap your existing trainer (including the optimized trainer variant) with `DebugPatch(trainer, debug_level=2)`.
++2. Call `debug_patch.train(...)` (or `train_epoch(...)`) instead of invoking the trainer directly.
++3. Use helpers such as `quick_diagnose` and `validate_batch` to inspect datasets and batches before long runs.
++
++See **`DEBUG_PATCH_WALKTHROUGH.md`** for a step-by-step integration checklist tailored to this release.
++
++>  **Notebook tip:** In `Hermes_0_3_7_6.ipynb` place the debug-patch import/wrapper cell immediately above the cell that launches training. Comment out (or skip) the old "Initiate model" cell so the optimized trainer is only constructed once before being wrapped.
++
++---
+ 
+EOF
+)
